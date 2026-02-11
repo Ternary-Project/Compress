@@ -2,11 +2,11 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 from io import BytesIO
 import time
+import traceback # Added for deep debugging
 
-# --- IMPORT YOUR MODULE ---
+# --- IMPORT MODULE ---
 try:
     from TPS import DeltaTernary
 except ImportError:
@@ -22,175 +22,166 @@ st.set_page_config(
 )
 
 # --- HEADER ---
-st.title("🔍 TPS Compressor v1.0")
+st.title("🔍 TPS Compressor v1.2 (Debug Mode)")
 st.markdown("**40× Compression • Real-time Pattern Analysis • HFT Analytics**")
 
 # --- SIDEBAR ---
-st.sidebar.header("⚙️ Compression Settings")
-threshold = st.sidebar.slider(
-    "Threshold", 
-    0.0001, 0.05, 0.005, 0.0001,
-    format="%.4f",
-    help="0.005 = ~40× compression (optimal)"
-)
+st.sidebar.header("⚙️ Settings")
+threshold = st.sidebar.slider("Threshold", 0.0001, 0.05, 0.005, 0.0001, format="%.4f")
 analyze_patterns = st.sidebar.checkbox("🔍 Analyze Patterns", value=True)
-show_accuracy = st.sidebar.checkbox("📊 Show Accuracy Metrics", value=True)
 
 # --- MAIN LAYOUT ---
 col1, col2 = st.columns([2, 1])
 
 with col1:
-    st.subheader("📂 Upload CSV")
-    uploaded_file = st.file_uploader(
-        "Choose OHLCV CSV file", 
-        type=["csv"],
-        help="Upload price data (Close column required)"
-    )
+    st.subheader("📂 Upload Data")
+    uploaded_file = st.file_uploader("Choose CSV file", type=["csv"])
 
 with col2:
     st.subheader("📊 Live Stats")
-    # Placeholders for metrics
     if 'stats' not in st.session_state:
-        st.info("Upload a file to see stats.")
+        st.info("Waiting for data...")
     else:
         m1, m2 = st.columns(2)
         m1.metric("Ratio", f"{st.session_state.stats['ratio']:.1f}×")
         m2.metric("Size", f"{st.session_state.stats['tps_size']:.2f} MB")
 
-# --- PROCESSING ---
+# --- PROCESSING LOGIC ---
 if uploaded_file is not None:
-    # Load Data
     try:
+        # 1. Load Data
         df = pd.read_csv(uploaded_file)
         
-        # Auto-detect price column
-        price_cols = [c for c in df.columns if 'close' in c.lower() or 'price' in c.lower()]
-        if not price_cols:
-            price_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+        # 2. Column Selection
+        # We try to be smart about picking the column, but let user override
+        numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+        default_idx = 0
+        
+        # Try to find 'Close' or 'Price'
+        for i, col in enumerate(numeric_cols):
+            if 'close' in col.lower() or 'price' in col.lower():
+                default_idx = i
+                break
         
         with col1:
-            selected_col = st.selectbox("Select Price Column", price_cols, index=0)
-            st.caption(f"Loaded {len(df):,} rows")
+            selected_col = st.selectbox("Select Price Column", numeric_cols, index=default_idx)
+            
+            # Special handling for IndexData.csv (filtering indices)
+            if "Index" in df.columns and len(df["Index"].unique()) > 1:
+                st.warning("⚠️ Multiple Indices detected! Filtering to the first one.")
+                first_index = df["Index"].unique()[0]
+                df = df[df["Index"] == first_index]
+                st.caption(f"Filtered to Index: **{first_index}**")
 
+            st.caption(f"Processing {len(df):,} rows")
+
+        # 3. Prepare Prices
         prices = df[selected_col].dropna().values.astype(float)
 
-        # Action Button
         if st.button("🚀 COMPRESS & ANALYZE", type="primary", use_container_width=True):
-            with st.spinner("Running Delta-Ternary Algorithm..."):
+            with st.spinner("Crunching numbers..."):
                 start_time = time.time()
                 
-                # 1. Initialize & Compress
+                # --- CORE ALGORITHM ---
                 dt = DeltaTernary(threshold=threshold)
                 packed, orig_len = dt.compress(prices)
                 process_time = time.time() - start_time
                 
-                # 2. Reconstruct (Verification)
-                recovered = dt.decompress(packed, orig_len, prices[0])
+                # --- PATTERN DETECTION (FIXED) ---
+                pat_count = 0
+                patterns = {}
                 
-                # 3. Calculations
+                if analyze_patterns:
+                    # TPS.py returns Dict[str, int] (Counts) OR Dict[str, List[int]] (Positions)
+                    patterns = dt.detect_all_patterns(packed, orig_len)
+                    
+                    # ROBUST COUNTING LOGIC
+                    total_hits = 0
+                    for key, val in patterns.items():
+                        if isinstance(val, int):
+                            total_hits += val  # It's just a count
+                        elif isinstance(val, list):
+                            total_hits += len(val) # It's a list of positions
+                        else:
+                            total_hits += 0
+                    pat_count = total_hits
+
+                # --- STATS CALCULATION ---
                 raw_size_mb = prices.nbytes / 1e6
                 tps_size_mb = len(packed) / 1e6
                 ratio = raw_size_mb / tps_size_mb if tps_size_mb > 0 else 0
                 
-                # Accuracy Stats
-                correlation = np.corrcoef(prices, recovered)[0,1]
-                
-                # Pattern Detection
-                pat_count = 0
-                patterns = {}
-                if analyze_patterns:
-                    patterns = dt.detect_all_patterns(packed, orig_len)
-                    pat_count = sum(len(p) for p in patterns.values())
+                # Reconstruction for Chart
+                recovered = dt.decompress(packed, orig_len, prices[0])
+                correlation = np.corrcoef(prices, recovered)[0,1] if len(prices) > 1 else 0
 
-                # Save to Session State
+                # Save to State
                 st.session_state.stats = {
                     'ratio': ratio,
                     'tps_size': tps_size_mb,
                     'patterns': pat_count,
                     'time': process_time,
                     'correlation': correlation,
+                    'recovered': recovered,
+                    'patterns_data': patterns,
                     'packed': packed,
                     'orig_len': orig_len,
-                    'recovered': recovered,
-                    'patterns_data': patterns
+                    'start_price': prices[0]
                 }
-                
                 st.rerun()
 
     except Exception as e:
-        st.error(f"Error reading file: {e}")
+        st.error("💥 An error occurred during processing!")
+        # This prints the EXACT line number and error reason to the screen
+        st.exception(e) 
 
 # --- RESULTS DASHBOARD ---
 if 'stats' in st.session_state:
     st.divider()
-    st.header("📈 Results Dashboard")
-    
     stats = st.session_state.stats
     
-    # 1. Key Metrics
-    k1, k2, k3, k4 = st.columns(4)
-    k1.metric("Compression Ratio", f"{stats['ratio']:.1f}×", delta="High Efficiency")
-    k2.metric("Processing Time", f"{stats['time']:.4f}s", delta="Real-time")
-    k3.metric("Correlation", f"{stats['correlation']:.5f}", help="1.0 is perfect match")
-    k4.metric("Patterns Detected", f"{stats['patterns']:,}", help="Stop-Loss, Squeezes, etc.")
+    # Metrics
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Compression", f"{stats['ratio']:.1f}×")
+    c2.metric("Time", f"{stats['time']:.4f}s")
+    c3.metric("Fidelity", f"{stats['correlation']:.4f}")
+    c4.metric("Patterns", f"{stats['patterns']:,}")
 
-    # 2. Charts
-    tab1, tab2 = st.tabs(["📉 Price Reconstruction", "🎯 Pattern Analysis"])
+    # Charts
+    tab1, tab2 = st.tabs(["📉 Chart", "🎯 Patterns"])
     
     with tab1:
-        # Plotly Chart: Original vs TPS
-        fig = go.Figure()
-        # Limit points for performance if massive
-        limit = 2000 
-        fig.add_trace(go.Scatter(y=prices[:limit], name='Original (Float64)', line=dict(color='blue', width=1)))
-        fig.add_trace(go.Scatter(y=stats['recovered'][:limit], name='TPS Reconstructed', line=dict(color='red', width=1, dash='dot')))
-        fig.update_layout(title="Reconstruction Fidelity (First 2000 candles)", height=400)
-        st.plotly_chart(fig, use_container_width=True)
-    
+        # Simple fast chart
+        limit = 5000  # Prevent lagging browser with too many points
+        chart_data = pd.DataFrame({
+            "Original": prices[:limit],
+            "TPS": stats['recovered'][:limit]
+        })
+        st.line_chart(chart_data)
+        if len(prices) > limit:
+            st.caption(f"Showing first {limit} candles (full dataset processed).")
+
     with tab2:
         if stats['patterns']:
-            # Convert dictionary to DataFrame for display
-            pat_data = [{"Pattern": k, "Occurrences": len(v)} for k, v in stats['patterns_data'].items()]
-            st.bar_chart(pd.DataFrame(pat_data).set_index("Pattern"))
+            # Handle display for both Integer counts and List counts
+            display_data = []
+            for k, v in stats['patterns_data'].items():
+                count = v if isinstance(v, int) else len(v)
+                display_data.append({"Pattern": k, "Count": count})
+            
+            st.bar_chart(pd.DataFrame(display_data).set_index("Pattern"))
         else:
-            st.info("No patterns analysis requested or none found.")
-
-    # 3. Downloads Area
+            st.info("No patterns found.")
+    
+    # Downloads
     st.divider()
-    st.subheader("💾 Export Data")
+    col_d1, col_d2 = st.columns(2)
     
-    d1, d2 = st.columns(2)
-    
-    # TPS Binary File Download
-    # We pack the necessary metadata into a .npz (numpy zip) for easy portability
-    buffer_tps = BytesIO()
-    np.savez_compressed(
-        buffer_tps, 
-        packed=stats['packed'], 
-        orig_len=stats['orig_len'], 
-        start_price=prices[0], 
-        threshold=threshold
-    )
-    
-    with d1:
-        st.download_button(
-            label="🔥 Download .TPS Package",
-            data=buffer_tps.getvalue(),
-            file_name="market_data.tps.npz",
-            mime="application/octet-stream",
-            use_container_width=True
-        )
+    # 1. TPS File
+    buffer = BytesIO()
+    np.savez_compressed(buffer, packed=stats['packed'], len=stats['orig_len'], start=stats['start_price'])
+    col_d1.download_button("💾 Download .TPS File", buffer.getvalue(), "data.tps.npz")
 
-    # CSV Verification Download
-    with d2:
-        # Create small dataframe for download
-        csv_df = pd.DataFrame({'Original': prices, 'TPS_Reconstructed': stats['recovered']})
-        buffer_csv = csv_df.to_csv(index=False).encode('utf-8')
-        
-        st.download_button(
-            label="📊 Download Verification CSV",
-            data=buffer_csv,
-            file_name="tps_verification.csv",
-            mime="text/csv",
-            use_container_width=True
-        )
+    # 2. CSV
+    csv = pd.DataFrame({'Price': stats['recovered']}).to_csv(index=False).encode('utf-8')
+    col_d2.download_button("📊 Download CSV", csv, "recovered.csv", "text/csv")
