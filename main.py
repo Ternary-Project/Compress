@@ -10,85 +10,173 @@ import time
 import struct
 
 # --- 1. LOSSLESS TPS ENGINE (Numeric 16x) ---
+# class LosslessTPS:
+#     def __init__(self, precision=10000):
+#         self.precision = precision
+#         self._powers = np.array([1, 3, 9, 27, 81], dtype=np.uint8)
+
+#     def compress(self, data):
+#         # 1. Quantize (Float -> Int)
+#         # Handle NaNs
+#         clean = np.nan_to_num(data, 0.0)
+#         quantized = np.round(clean * self.precision).astype(np.int32)
+        
+#         # 2. Delta Encoding
+#         deltas = np.diff(quantized, prepend=quantized[0])
+        
+#         # 3. Ternary Encoding (-1, 0, 1)
+#         # We split "Small Deltas" (Ternary) from "Large Deltas" (Exceptions)
+#         # This is the "Gorilla" style optimization
+        
+#         # Identify fits for ternary (-1, 0, 1)
+#         is_ternary = np.abs(deltas) <= 1
+#         trits = np.zeros(len(deltas), dtype=np.int8)
+#         trits[is_ternary] = deltas[is_ternary]
+        
+#         # Pack Trits (Structure)
+#         packed_trits = self._pack_trits(trits)
+        
+#         # Store Exceptions (Large Deltas) separately using Zstd
+#         # This is crucial. If delta is 500, ternary can't hold it.
+#         # We store the *index* and the *value* of exceptions.
+#         exceptions = deltas[~is_ternary]
+#         exception_indices = np.where(~is_ternary)[0].astype(np.uint32)
+        
+#         exc_bytes = exceptions.tobytes() + exception_indices.tobytes()
+#         compressed_exc = zstd.compress(exc_bytes, level=22) # Max compression
+        
+#         return {
+#             't': packed_trits,
+#             'e': compressed_exc,
+#             'v0': quantized[0],
+#             'len': len(data)
+#         }
+
+#     def decompress(self, packet):
+#         length = packet['len']
+        
+#         # 1. Unpack Trits
+#         trits = self._unpack_trits(packet['t'], length)
+        
+#         # 2. Restore Exceptions
+#         if len(packet['e']) > 0:
+#             raw_exc = zstd.decompress(packet['e'])
+#             # Split bytes in half (first half values, second half indices)
+#             # This logic depends on count. simpler to store count?
+#             # Let's infer. 
+#             # We know: indices are uint32 (4 bytes), values int32 (4 bytes).
+#             # So total size / 8 = number of exceptions.
+#             n_exc = len(raw_exc) // 8
+            
+#             exc_vals = np.frombuffer(raw_exc[:n_exc*4], dtype=np.int32)
+#             exc_idxs = np.frombuffer(raw_exc[n_exc*4:], dtype=np.uint32)
+            
+#             # Overwrite trits with actual large deltas
+#             trits[exc_idxs] = exc_vals
+            
+#         # 3. Reconstruct
+#         deltas = trits
+#         restored_ints = np.cumsum(deltas)
+#         # Fix offset (cumsum starts at deltas[0], which is 0 from diff)
+#         # real_sequence[0] = v0.
+#         # restored_ints[0] is 0. 
+#         # So we add v0 to everything.
+#         # Wait, diff(prepend=v0) -> d[0] = v0 - v0 = 0.
+#         # cumsum([0, d1, d2]) -> [0, d1, d1+d2]
+#         # + v0 -> [v0, v0+d1...] -> Correct.
+        
+#         quantized = restored_ints + packet['v0']
+        
+#         return quantized.astype(np.float64) / self.precision
+
+#     def _pack_trits(self, trits):
+#         storage = (trits + 1).astype(np.uint8)
+#         remainder = len(storage) % 5
+#         if remainder:
+#             storage = np.pad(storage, (0, 5 - remainder), constant_values=1)
+#         matrix = storage.reshape(-1, 5)
+#         return np.dot(matrix, self._powers).astype(np.uint8).tobytes()
+
+#     def _unpack_trits(self, packed, orig_len):
+#         raw = np.frombuffer(packed, dtype=np.uint8)
+#         temp = raw[:, np.newaxis]
+#         powers = self._powers[np.newaxis, :]
+#         trits = ((temp // powers) % 3).astype(np.int8).flatten()
+#         return (trits[:orig_len] - 1).astype(np.int32)
+
 class LosslessTPS:
     def __init__(self, precision=10000):
         self.precision = precision
+        # Pre-compute powers for speed
         self._powers = np.array([1, 3, 9, 27, 81], dtype=np.uint8)
 
     def compress(self, data):
-        # 1. Quantize (Float -> Int)
-        # Handle NaNs
+        # 1. Handle NaNs
         clean = np.nan_to_num(data, 0.0)
-        quantized = np.round(clean * self.precision).astype(np.int32)
+        
+        # ⚠️ FIX: Use int64 to prevent Volume overflow
+        # Old: .astype(np.int32) -> CRASHED on Volume
+        # New: .astype(np.int64) -> SAFELY holds Trillions
+        quantized = np.round(clean * self.precision).astype(np.int64)
         
         # 2. Delta Encoding
         deltas = np.diff(quantized, prepend=quantized[0])
         
         # 3. Ternary Encoding (-1, 0, 1)
-        # We split "Small Deltas" (Ternary) from "Large Deltas" (Exceptions)
-        # This is the "Gorilla" style optimization
-        
-        # Identify fits for ternary (-1, 0, 1)
+        # Use a slightly wider logic for 64-bit support if needed, 
+        # but the logic below remains the same for the "structure".
         is_ternary = np.abs(deltas) <= 1
         trits = np.zeros(len(deltas), dtype=np.int8)
         trits[is_ternary] = deltas[is_ternary]
         
-        # Pack Trits (Structure)
+        # Pack Trits
         packed_trits = self._pack_trits(trits)
         
-        # Store Exceptions (Large Deltas) separately using Zstd
-        # This is crucial. If delta is 500, ternary can't hold it.
-        # We store the *index* and the *value* of exceptions.
+        # 4. Store Exceptions (Large Deltas)
         exceptions = deltas[~is_ternary]
+        
+        # ⚠️ FIX: Store indices as uint32 (fine) but values as int64!
         exception_indices = np.where(~is_ternary)[0].astype(np.uint32)
         
+        # Combine: 8 bytes per value (int64) + 4 bytes per index (uint32)
         exc_bytes = exceptions.tobytes() + exception_indices.tobytes()
-        compressed_exc = zstd.compress(exc_bytes, level=22) # Max compression
+        compressed_exc = zstd.compress(exc_bytes, level=22)
         
         return {
             't': packed_trits,
             'e': compressed_exc,
-            'v0': quantized[0],
+            'v0': quantized[0], # First value
             'len': len(data)
         }
 
     def decompress(self, packet):
         length = packet['len']
         
-        # 1. Unpack Trits
-        trits = self._unpack_trits(packet['t'], length)
+        # 1. Unpack Trits (Target int64 array)
+        trits = self._unpack_trits(packet['t'], length).astype(np.int64)
         
         # 2. Restore Exceptions
         if len(packet['e']) > 0:
             raw_exc = zstd.decompress(packet['e'])
-            # Split bytes in half (first half values, second half indices)
-            # This logic depends on count. simpler to store count?
-            # Let's infer. 
-            # We know: indices are uint32 (4 bytes), values int32 (4 bytes).
-            # So total size / 8 = number of exceptions.
-            n_exc = len(raw_exc) // 8
             
-            exc_vals = np.frombuffer(raw_exc[:n_exc*4], dtype=np.int32)
-            exc_idxs = np.frombuffer(raw_exc[n_exc*4:], dtype=np.uint32)
+            # Calculate split point based on types
+            # total_bytes = (N * 8) + (N * 4) = N * 12
+            n_exc = len(raw_exc) // 12
             
-            # Overwrite trits with actual large deltas
+            # Read 64-bit Values then 32-bit Indices
+            exc_vals = np.frombuffer(raw_exc[:n_exc*8], dtype=np.int64)
+            exc_idxs = np.frombuffer(raw_exc[n_exc*8:], dtype=np.uint32)
+            
             trits[exc_idxs] = exc_vals
             
         # 3. Reconstruct
         deltas = trits
         restored_ints = np.cumsum(deltas)
-        # Fix offset (cumsum starts at deltas[0], which is 0 from diff)
-        # real_sequence[0] = v0.
-        # restored_ints[0] is 0. 
-        # So we add v0 to everything.
-        # Wait, diff(prepend=v0) -> d[0] = v0 - v0 = 0.
-        # cumsum([0, d1, d2]) -> [0, d1, d1+d2]
-        # + v0 -> [v0, v0+d1...] -> Correct.
-        
         quantized = restored_ints + packet['v0']
         
         return quantized.astype(np.float64) / self.precision
 
+    # ... keep _pack_trits and _unpack_trits the same ...
     def _pack_trits(self, trits):
         storage = (trits + 1).astype(np.uint8)
         remainder = len(storage) % 5
@@ -102,7 +190,7 @@ class LosslessTPS:
         temp = raw[:, np.newaxis]
         powers = self._powers[np.newaxis, :]
         trits = ((temp // powers) % 3).astype(np.int8).flatten()
-        return (trits[:orig_len] - 1).astype(np.int32)
+        return (trits[:orig_len] - 1)
 
 # --- 2. HYBRID COMPRESSOR (100x Logic) ---
 def compress_ultimate(df, password=None):
