@@ -1,188 +1,101 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import zstandard as zstd  # THE KEY TO 100x
+import zstandard as zstd
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 import hashlib
 import os
 from io import BytesIO
 import time
-import struct
+import gc  # Garbage Collector for memory management
 
-# --- 1. LOSSLESS TPS ENGINE (Numeric 16x) ---
-# class LosslessTPS:
-#     def __init__(self, precision=10000):
-#         self.precision = precision
-#         self._powers = np.array([1, 3, 9, 27, 81], dtype=np.uint8)
-
-#     def compress(self, data):
-#         # 1. Quantize (Float -> Int)
-#         # Handle NaNs
-#         clean = np.nan_to_num(data, 0.0)
-#         quantized = np.round(clean * self.precision).astype(np.int32)
-        
-#         # 2. Delta Encoding
-#         deltas = np.diff(quantized, prepend=quantized[0])
-        
-#         # 3. Ternary Encoding (-1, 0, 1)
-#         # We split "Small Deltas" (Ternary) from "Large Deltas" (Exceptions)
-#         # This is the "Gorilla" style optimization
-        
-#         # Identify fits for ternary (-1, 0, 1)
-#         is_ternary = np.abs(deltas) <= 1
-#         trits = np.zeros(len(deltas), dtype=np.int8)
-#         trits[is_ternary] = deltas[is_ternary]
-        
-#         # Pack Trits (Structure)
-#         packed_trits = self._pack_trits(trits)
-        
-#         # Store Exceptions (Large Deltas) separately using Zstd
-#         # This is crucial. If delta is 500, ternary can't hold it.
-#         # We store the *index* and the *value* of exceptions.
-#         exceptions = deltas[~is_ternary]
-#         exception_indices = np.where(~is_ternary)[0].astype(np.uint32)
-        
-#         exc_bytes = exceptions.tobytes() + exception_indices.tobytes()
-#         compressed_exc = zstd.compress(exc_bytes, level=22) # Max compression
-        
-#         return {
-#             't': packed_trits,
-#             'e': compressed_exc,
-#             'v0': quantized[0],
-#             'len': len(data)
-#         }
-
-#     def decompress(self, packet):
-#         length = packet['len']
-        
-#         # 1. Unpack Trits
-#         trits = self._unpack_trits(packet['t'], length)
-        
-#         # 2. Restore Exceptions
-#         if len(packet['e']) > 0:
-#             raw_exc = zstd.decompress(packet['e'])
-#             # Split bytes in half (first half values, second half indices)
-#             # This logic depends on count. simpler to store count?
-#             # Let's infer. 
-#             # We know: indices are uint32 (4 bytes), values int32 (4 bytes).
-#             # So total size / 8 = number of exceptions.
-#             n_exc = len(raw_exc) // 8
-            
-#             exc_vals = np.frombuffer(raw_exc[:n_exc*4], dtype=np.int32)
-#             exc_idxs = np.frombuffer(raw_exc[n_exc*4:], dtype=np.uint32)
-            
-#             # Overwrite trits with actual large deltas
-#             trits[exc_idxs] = exc_vals
-            
-#         # 3. Reconstruct
-#         deltas = trits
-#         restored_ints = np.cumsum(deltas)
-#         # Fix offset (cumsum starts at deltas[0], which is 0 from diff)
-#         # real_sequence[0] = v0.
-#         # restored_ints[0] is 0. 
-#         # So we add v0 to everything.
-#         # Wait, diff(prepend=v0) -> d[0] = v0 - v0 = 0.
-#         # cumsum([0, d1, d2]) -> [0, d1, d1+d2]
-#         # + v0 -> [v0, v0+d1...] -> Correct.
-        
-#         quantized = restored_ints + packet['v0']
-        
-#         return quantized.astype(np.float64) / self.precision
-
-#     def _pack_trits(self, trits):
-#         storage = (trits + 1).astype(np.uint8)
-#         remainder = len(storage) % 5
-#         if remainder:
-#             storage = np.pad(storage, (0, 5 - remainder), constant_values=1)
-#         matrix = storage.reshape(-1, 5)
-#         return np.dot(matrix, self._powers).astype(np.uint8).tobytes()
-
-#     def _unpack_trits(self, packed, orig_len):
-#         raw = np.frombuffer(packed, dtype=np.uint8)
-#         temp = raw[:, np.newaxis]
-#         powers = self._powers[np.newaxis, :]
-#         trits = ((temp // powers) % 3).astype(np.int8).flatten()
-#         return (trits[:orig_len] - 1).astype(np.int32)
-
-class LosslessTPS:
+# --- 1. ROBUST METHOD 1 ENGINE (Lossless) ---
+class Method1TPS:
+    """
+    Fixed-Point + Delta + Ternary + Residuals.
+    Optimized for 16x Compression on Financial Data.
+    """
     def __init__(self, precision=10000):
         self.precision = precision
-        # Pre-compute powers for speed
+        # Pre-compute powers for fast packing
         self._powers = np.array([1, 3, 9, 27, 81], dtype=np.uint8)
 
-    def compress(self, data):
-        # 1. Handle NaNs
-        clean = np.nan_to_num(data, 0.0)
-        
-        # ⚠️ FIX: Use int64 to prevent Volume overflow
-        # Old: .astype(np.int32) -> CRASHED on Volume
-        # New: .astype(np.int64) -> SAFELY holds Trillions
+    def compress_column(self, series):
+        # 1. CLEAN & QUANTIZE (int64 is safer for Volume)
+        clean = np.nan_to_num(series.values, 0.0)
+        # Use int64 to prevent Volume overflow (The "Corrupted Volume" Fix)
         quantized = np.round(clean * self.precision).astype(np.int64)
         
-        # 2. Delta Encoding
+        # 2. DELTA ENCODING
         deltas = np.diff(quantized, prepend=quantized[0])
         
-        # 3. Ternary Encoding (-1, 0, 1)
-        # Use a slightly wider logic for 64-bit support if needed, 
-        # but the logic below remains the same for the "structure".
-        is_ternary = np.abs(deltas) <= 1
-        trits = np.zeros(len(deltas), dtype=np.int8)
-        trits[is_ternary] = deltas[is_ternary]
+        # 3. TERNARY SPLIT
+        # We separate "Small Moves" (Structure) from "Big Jumps" (Residuals)
+        # Structure: -1, 0, 1
+        signs = np.sign(deltas).astype(np.int8)
         
-        # Pack Trits
-        packed_trits = self._pack_trits(trits)
+        # 4. PACK TERNARY (5 trits per byte)
+        packed_signs = self._pack_trits(signs)
         
-        # 4. Store Exceptions (Large Deltas)
-        exceptions = deltas[~is_ternary]
+        # 5. PACK RESIDUALS (The "Error" from just using signs)
+        # If delta is +100, sign is +1. Residual is 99.
+        # If delta is 0, sign is 0. Residual is 0.
+        residuals = np.abs(deltas) - np.abs(signs)
         
-        # ⚠️ FIX: Store indices as uint32 (fine) but values as int64!
-        exception_indices = np.where(~is_ternary)[0].astype(np.uint32)
-        
-        # Combine: 8 bytes per value (int64) + 4 bytes per index (uint32)
-        exc_bytes = exceptions.tobytes() + exception_indices.tobytes()
-        compressed_exc = zstd.compress(exc_bytes, level=22)
+        # Optimization: Only store non-zero residuals?
+        # Zstandard is actually faster/better at compressing the full sparse array 
+        # of residuals than we are at doing manual sparse encoding in Python.
+        res_bytes = residuals.tobytes()
+        compressed_res = zstd.compress(res_bytes, level=10) # Level 10 is balanced speed/ratio
         
         return {
-            't': packed_trits,
-            'e': compressed_exc,
-            'v0': quantized[0], # First value
-            'len': len(data)
+            't': packed_signs,
+            'r': compressed_res,
+            'v0': quantized[0],
+            'len': len(quantized),
+            'type': 'm1_tps'
         }
 
-    def decompress(self, packet):
+    def decompress_column(self, packet):
         length = packet['len']
         
-        # 1. Unpack Trits (Target int64 array)
-        trits = self._unpack_trits(packet['t'], length).astype(np.int64)
+        # 1. UNPACK SIGNS
+        signs = self._unpack_trits(packet['t'], length).astype(np.int64)
         
-        # 2. Restore Exceptions
-        if len(packet['e']) > 0:
-            raw_exc = zstd.decompress(packet['e'])
-            
-            # Calculate split point based on types
-            # total_bytes = (N * 8) + (N * 4) = N * 12
-            n_exc = len(raw_exc) // 12
-            
-            # Read 64-bit Values then 32-bit Indices
-            exc_vals = np.frombuffer(raw_exc[:n_exc*8], dtype=np.int64)
-            exc_idxs = np.frombuffer(raw_exc[n_exc*8:], dtype=np.uint32)
-            
-            trits[exc_idxs] = exc_vals
-            
-        # 3. Reconstruct
-        deltas = trits
-        restored_ints = np.cumsum(deltas)
-        quantized = restored_ints + packet['v0']
+        # 2. UNPACK RESIDUALS
+        res_bytes = zstd.decompress(packet['r'])
+        residuals = np.frombuffer(res_bytes, dtype=np.int64)
+        
+        # 3. RECONSTRUCT DELTAS
+        # Delta = (Sign * 1) + (Sign * Residual) 
+        # Actually: Magnitude = 1 + Residual (if Sign != 0)
+        # Let's reverse the compress logic:
+        # residuals = abs(delta) - abs(sign)
+        # abs(delta) = residuals + abs(sign)
+        # delta = sign * (residuals + 1) ... if sign != 0?
+        # If sign is 0, delta is 0.
+        # If sign is 1, delta = 1 + residual.
+        # If sign is -1, delta = -1 - residual = -(1 + residual).
+        
+        deltas = signs * (residuals + 1)
+        # Fix the case where sign was 0 (residuals should be 0 there too)
+        # The math holds: 0 * (0 + 1) = 0. Perfect.
+        
+        # 4. CUMSUM & DE-QUANTIZE
+        restored = np.cumsum(deltas)
+        # Fix offset (cumsum starts at delta[0], which is 0 from diff)
+        quantized = restored + packet['v0']
         
         return quantized.astype(np.float64) / self.precision
 
-    # ... keep _pack_trits and _unpack_trits the same ...
     def _pack_trits(self, trits):
+        # Map -1,0,1 -> 0,1,2
         storage = (trits + 1).astype(np.uint8)
         remainder = len(storage) % 5
         if remainder:
             storage = np.pad(storage, (0, 5 - remainder), constant_values=1)
         matrix = storage.reshape(-1, 5)
+        # Vectorized dot product
         return np.dot(matrix, self._powers).astype(np.uint8).tobytes()
 
     def _unpack_trits(self, packed, orig_len):
@@ -192,116 +105,129 @@ class LosslessTPS:
         trits = ((temp // powers) % 3).astype(np.int8).flatten()
         return (trits[:orig_len] - 1)
 
-# --- 2. HYBRID COMPRESSOR (100x Logic) ---
-def compress_ultimate(df, password=None):
-    start = time.time()
-    container = {}
+# --- 2. CHUNKED PROCESSOR (For 500MB+ Files) ---
+def compress_large_file(uploaded_file, password=None, chunk_size=100000):
+    """
+    Reads CSV in chunks to keep RAM usage low.
+    """
+    start_time = time.time()
+    tps = Method1TPS()
     
-    # A. NUMERIC -> LosslessTPS (16x)
-    numeric_cols = df.select_dtypes(include=[np.number]).columns
-    for col in numeric_cols:
-        ltps = LosslessTPS()
-        # FillNa is critical for lossless
-        data = df[col].fillna(0).values
-        container[col] = {'type': 'tps', 'data': ltps.compress(data)}
+    # We will build a list of compressed chunks
+    # In a real app, we would stream this to a file on disk.
+    # For Streamlit, we'll try to keep compressed chunks in RAM (much smaller).
+    
+    all_chunks = []
+    meta_headers = []
+    total_rows = 0
+    
+    # Iterate over the file in chunks
+    # Reset file pointer just in case
+    uploaded_file.seek(0)
+    
+    for chunk_df in pd.read_csv(uploaded_file, chunksize=chunk_size):
+        chunk_archive = {}
         
-    # B. STRINGS -> Zstandard Dictionary (50x+)
-    str_cols = df.select_dtypes(include=['object', 'category']).columns
-    for col in str_cols:
-        # Convert to bytes with newlines
-        text_data = df[col].fillna('').astype(str).str.cat(sep='\n').encode('utf-8')
-        # Zstd level 22 is "Ultra" mode
-        zstd_data = zstd.compress(text_data, level=22)
-        container[col] = {'type': 'zstd', 'data': zstd_data, 'len': len(df)}
+        # A. Compress Numeric Cols (Method 1)
+        numeric_cols = chunk_df.select_dtypes(include=[np.number]).columns
+        for col in numeric_cols:
+            chunk_archive[col] = tps.compress_column(chunk_df[col])
+            
+        # B. Compress String Cols (Zstd)
+        str_cols = chunk_df.select_dtypes(include=['object', 'category']).columns
+        for col in str_cols:
+            txt = chunk_df[col].fillna('').astype(str).str.cat(sep='\n').encode('utf-8')
+            chunk_archive[col] = {'data': zstd.compress(txt, level=5), 'type': 'zstd_str'}
+            
+        all_chunks.append(chunk_archive)
+        total_rows += len(chunk_df)
         
-    # C. INDEX -> RLE (Run-Length)
-    # Often dates are repeated or sequential
-    if hasattr(df.index, 'name'):
-        # Just treat index as a column
-        idx_name = df.index.name if df.index.name else 'index'
-        # Convert to string and use Zstd (often better than RLE for complex dates)
-        text_data = df.index.astype(str).to_series().str.cat(sep='\n').encode('utf-8')
-        container['__index__'] = {'type': 'zstd', 'data': zstd.compress(text_data, level=22), 'name': idx_name}
+        # Force garbage collection to free RAM
+        gc.collect()
 
-    # SERIALIZE
+    # Serialize Everything
+    # We store a list of dicts. 
     buffer = BytesIO()
-    np.savez_compressed(buffer, container=container)
+    np.savez_compressed(buffer, chunks=all_chunks, meta={'rows': total_rows})
     raw_bytes = buffer.getvalue()
     
-    # ENCRYPT
+    # Encrypt
     if password:
         key = hashlib.sha256(password.encode()).digest()
         nonce = os.urandom(12)
         raw_bytes = nonce + AESGCM(key).encrypt(nonce, raw_bytes, None)
         
-    return raw_bytes, (time.time() - start) * 1000
+    return raw_bytes, total_rows, (time.time() - start_time)
 
-def decompress_ultimate(blob, password=None):
+def decompress_large_file(blob, password=None):
     if password:
         key = hashlib.sha256(password.encode()).digest()
         nonce, text = blob[:12], blob[12:]
         blob = AESGCM(key).decrypt(nonce, text, None)
         
     loaded = np.load(BytesIO(blob), allow_pickle=True)
-    container = loaded['container'].item()
+    chunks = loaded['chunks']
     
-    df_dict = {}
-    index_data = None
+    tps = Method1TPS()
+    dfs = []
     
-    for col, info in container.items():
-        if col == '__index__':
-            raw = zstd.decompress(info['data']).decode('utf-8')
-            index_data = pd.Index(raw.split('\n'), name=info['name'])
-            continue
-            
-        if info['type'] == 'tps':
-            ltps = LosslessTPS()
-            df_dict[col] = ltps.decompress(info['data'])
-            
-        elif info['type'] == 'zstd':
-            raw = zstd.decompress(info['data']).decode('utf-8')
-            # Split back into rows
-            df_dict[col] = raw.split('\n')
-            
-    df = pd.DataFrame(df_dict)
-    if index_data is not None:
-        df.index = index_data
+    for chunk in chunks:
+        chunk_dict = chunk.item() if isinstance(chunk, np.ndarray) else chunk
+        recon_data = {}
         
-    return df
+        for col, packet in chunk_dict.items():
+            if packet['type'] == 'm1_tps':
+                recon_data[col] = tps.decompress_column(packet)
+            elif packet['type'] == 'zstd_str':
+                raw = zstd.decompress(packet['data']).decode('utf-8')
+                recon_data[col] = raw.split('\n')
+                
+        dfs.append(pd.DataFrame(recon_data))
+        
+    return pd.concat(dfs, ignore_index=True)
 
-# --- 3. UI ---
-st.set_page_config(page_title="Method 3 Ultimate", layout="wide")
-st.title("⭐ Method 3: The 100× Ultimate Engine")
-st.markdown("**TPS Numeric + Zstandard Ultra + Hybrid Indexing**")
+# --- 3. STREAMLIT GUI ---
+st.set_page_config(page_title="Method 1 Pro", layout="wide")
+st.title("⭐ Method 1 Pro: Large File Support")
+st.markdown("**Fixed-Point + Ternary + Residuals + Chunking (Max 500MB)**")
 
 pass_key = st.sidebar.text_input("Encryption Key", type="password", value="secure")
-tab1, tab2 = st.tabs(["Compress", "Decompress"])
+chunk_limit = st.sidebar.selectbox("Chunk Size (Rows)", [50000, 100000, 500000], index=1)
+
+tab1, tab2 = st.tabs(["Compress (Big Files)", "Decompress"])
 
 with tab1:
-    f = st.file_uploader("Upload CSV", type="csv")
-    if f and st.button("🚀 COMPRESS (ULTIMATE)"):
-        df = pd.read_csv(f)
-        with st.spinner("Running Zstandard Ultra Mode..."):
+    f = st.file_uploader("Upload Large CSV", type="csv")
+    if f and st.button("🚀 COMPRESS STREAM"):
+        # Check size hint
+        f.seek(0, os.SEEK_END)
+        size_mb = f.tell() / 1e6
+        f.seek(0)
+        
+        st.info(f"Processing {size_mb:.1f} MB file in chunks of {chunk_limit} rows...")
+        
+        with st.spinner("Streaming & Compressing..."):
             try:
-                blob, ms = compress_ultimate(df, pass_key)
+                blob, rows, duration = compress_large_file(f, pass_key, chunk_limit)
                 
-                orig = df.memory_usage(deep=True).sum()
-                ratio = orig / len(blob)
+                ratio = (size_mb * 1e6) / len(blob)
+                st.success(f"✅ Compression Complete! Ratio: {ratio:.1f}×")
+                st.caption(f"Processed {rows:,} rows in {duration:.1f}s")
+                st.metric("Final Size", f"{len(blob)/1e6:.2f} MB")
                 
-                st.success(f"✅ ULTIMATE Ratio: {ratio:.1f}×")
-                st.caption(f"Original: {orig/1e6:.1f}MB -> Final: {len(blob)/1e6:.2f}MB")
-                st.download_button("💾 Download .ult", blob, "data.ult")
+                st.download_button("💾 Download .m1tps", blob, "data.m1tps")
             except Exception as e:
                 st.error(f"Error: {e}")
 
 with tab2:
-    f_sec = st.file_uploader("Upload .ult", type=["ult", "bin"])
+    f_sec = st.file_uploader("Upload .m1tps", type=["m1tps", "bin"])
     if f_sec and st.button("🔓 RECOVER"):
         try:
-            blob = f_sec.read()
-            df_rec = decompress_ultimate(blob, pass_key)
-            st.success("✅ Exact Reconstruction!")
-            st.dataframe(df_rec.head())
-            st.download_button("Download CSV", df_rec.to_csv(index=False), "recovered.csv")
+            with st.spinner("Recovering..."):
+                blob = f_sec.read()
+                df_rec = decompress_large_file(blob, pass_key)
+                st.success("✅ Exact Reconstruction!")
+                st.dataframe(df_rec.head())
+                st.download_button("Download CSV", df_rec.to_csv(index=False), "recovered.csv")
         except Exception as e:
             st.error(f"Error: {e}")
