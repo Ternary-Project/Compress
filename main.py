@@ -8,104 +8,75 @@ import os
 from io import BytesIO
 import time
 
-# --- 1. SMART ENCODER (The New Logic) ---
+# --- 1. SMART ENCODER ENGINE (Hybrid Lossless) ---
 class SmartEncoder:
     def __init__(self):
-        self.dictionaries = {}  # Stores string maps
+        self.dictionaries = {}
 
     def compress_column(self, series):
-        """Decides the best compression for a column"""
-        # A. Strings/Categorical -> Dictionary Encoding
+        """Decides best compression: Dictionary (Strings) vs RLE (Repeats) vs LZ4"""
+        # A. Strings -> Dictionary Encoding
         if series.dtype == 'object' or series.dtype.name == 'category':
-            # Create a map: "BTC" -> 0, "ETH" -> 1
             uniques, codes = np.unique(series.astype(str), return_inverse=True)
             self.dictionaries[series.name] = uniques.tolist()
-            # If < 256 unique strings, pack into 1 byte!
             if len(uniques) < 256:
                 return codes.astype(np.uint8).tobytes(), 'dict_u8'
             return codes.astype(np.uint16).tobytes(), 'dict_u16'
 
         # B. Repeated Numbers -> Run-Length Encoding (RLE)
-        # Perfect for 'Volume' or Status codes with many repeats
         val = series.values
         if len(val) > 100:
-            # Calculate repetition ratio
             n_unique = len(np.unique(val))
-            if n_unique < len(val) * 0.1: # If 90% is repeated
+            if n_unique < len(val) * 0.1:  # If 90% is repeated data
                 return self._rle_encode(val), 'rle'
 
-        # C. Default -> Numpy Bytes (Lossless)
+        # C. Default -> Numpy Bytes
         return val.tobytes(), str(series.dtype)
 
     def _rle_encode(self, arr):
-        """Run-Length Encoder: [5,5,5,9] -> [5, 9], [3, 1]"""
         n = len(arr)
         if n == 0: return b""
-        
-        y = arr[1:] != arr[:-1]       # Find where values change
-        i = np.append(np.where(y), n - 1) # Indices of changes
-        z = np.diff(np.append(-1, i)) # Run lengths
-        
+        y = arr[1:] != arr[:-1]
+        i = np.append(np.where(y), n - 1)
+        z = np.diff(np.append(-1, i))
         values = arr[i]
         counts = z
-        
-        # Interleave values and counts
-        # This is a simple binary pack: [Val1, Count1, Val2, Count2...]
-        # Optimizing types for compactness
         if np.issubdtype(arr.dtype, np.integer):
             packed = np.column_stack((values, counts.astype(np.int32))).flatten()
         else:
-            # For floats, we keep them as is, assume counts are int32
-            # (A robust implementation would use struct packing here)
             packed = np.column_stack((values, counts.astype(np.float64))).flatten()
-            
         return packed.tobytes()
 
     def decompress_column(self, data, method, col_name, orig_len):
-        """Reverses the compression"""
         if method.startswith('dict'):
             dtype = np.uint8 if method == 'dict_u8' else np.uint16
             codes = np.frombuffer(data, dtype=dtype)
             mapping = self.dictionaries[col_name]
             return pd.Series([mapping[i] for i in codes])
-            
         elif method == 'rle':
-            # Simplified RLE decode
-            # Assumes standard integer data for demo
-            arr = np.frombuffer(data, dtype=np.int32) # Simplification
+            arr = np.frombuffer(data, dtype=np.int32)
             values = arr[::2]
             counts = arr[1::2]
             return pd.Series(np.repeat(values, counts))
-            
         else:
-            # Standard numpy restore
             return pd.Series(np.frombuffer(data, dtype=method))
 
-# --- 2. PIPELINE UPGRADE ---
-
+# --- 2. PIPELINE FUNCTIONS ---
 def compress_hybrid(df, password=None):
     start = time.time()
     encoder = SmartEncoder()
     archive = {}
     
-    # 1. ENCODE EACH COLUMN
     for col in df.columns:
         packed, method = encoder.compress_column(df[col])
-        archive[col] = {
-            'data': packed,
-            'method': method,
-            'orig_len': len(df)
-        }
+        archive[col] = {'data': packed, 'method': method, 'orig_len': len(df)}
     
-    # Save Dictionaries (Metadata)
     archive['_meta_dicts'] = encoder.dictionaries
-
-    # 2. SERIALIZE (Pickle-free for security)
+    
     buffer = BytesIO()
     np.savez_compressed(buffer, **archive)
     raw_bytes = buffer.getvalue()
 
-    # 3. AES-GCM ENCRYPTION
     final_bytes = raw_bytes
     if password:
         key = hashlib.sha256(password.encode()).digest()
@@ -114,9 +85,8 @@ def compress_hybrid(df, password=None):
         ciphertext = aesgcm.encrypt(nonce, raw_bytes, None)
         final_bytes = nonce + ciphertext
 
-    # Stats
     original_size = df.memory_usage(deep=True).sum()
-    ratio = original_size / len(final_bytes)
+    ratio = original_size / len(final_bytes) if len(final_bytes) > 0 else 0
     
     return final_bytes, {
         'ratio': ratio,
@@ -125,7 +95,6 @@ def compress_hybrid(df, password=None):
     }
 
 def decompress_hybrid(secure_bytes, password=None):
-    # 1. DECRYPT
     if password:
         key = hashlib.sha256(password.encode()).digest()
         aesgcm = AESGCM(key)
@@ -135,42 +104,72 @@ def decompress_hybrid(secure_bytes, password=None):
     else:
         raw_bytes = secure_bytes
 
-    # 2. DESERIALIZE
     data = np.load(BytesIO(raw_bytes), allow_pickle=True)
     encoder = SmartEncoder()
     encoder.dictionaries = data['_meta_dicts'].item()
     
-    # 3. RECONSTRUCT
     df_dict = {}
     for file in data.files:
         if file == '_meta_dicts': continue
         col_info = data[file].item()
-        
-        # Handle the column data
         df_dict[file] = encoder.decompress_column(
-            col_info['data'], 
-            col_info['method'], 
-            file, 
-            col_info['orig_len']
+            col_info['data'], col_info['method'], file, col_info['orig_len']
         )
-        
     return pd.DataFrame(df_dict)
 
-# --- STREAMLIT UI UPDATE ---
-# (Paste this into your main block)
+# --- 3. STREAMLIT GUI ---
+st.set_page_config(page_title="AGLTPS Hybrid", layout="wide")
+st.title("🔒 AGLTPS v2.0: Hybrid Lossless Compressor")
+st.markdown("**Dictionary Encoding (Strings) + RLE (Repeats) + AES-GCM (Security)**")
 
-if st.button("🚀 HYBRID LOSSLESS COMPRESS"):
+# Sidebar
+password = st.sidebar.text_input("🔐 Encryption Password", type="password", value="default-key")
+
+tab1, tab2 = st.tabs(["📦 Compress", "🔓 Decompress"])
+
+with tab1:
+    st.header("Compress Dataset")
+    # DEFINING uploaded_file HERE is crucial
+    uploaded_file = st.file_uploader("📂 Upload CSV", type="csv")
+    
     if uploaded_file:
         df = pd.read_csv(uploaded_file)
-        
-        # Run the new hybrid engine
-        secure_blob, stats = compress_hybrid(df, password="test")
-        
-        st.success(f"✅ Lossless Compression: {stats['ratio']:.1f}×")
-        st.info("Methods Used: Dictionary (Strings), RLE (Repeats), LZ4 (Numbers)")
-        
-        st.download_button(
-            "💾 Download Hybrid Secure File", 
-            secure_blob, 
-            "hybrid_data.agltps"
-        )
+        st.dataframe(df.head())
+        st.caption(f"Loaded {len(df):,} rows. Columns: {list(df.columns)}")
+
+        if st.button("🚀 RUN HYBRID COMPRESSION", type="primary"):
+            with st.spinner("Analyzing patterns & compressing..."):
+                try:
+                    secure_blob, stats = compress_hybrid(df, password)
+                    
+                    st.success(f"✅ Success! Compression Ratio: {stats['ratio']:.1f}×")
+                    
+                    c1, c2 = st.columns(2)
+                    c1.metric("Final Size", f"{stats['final_mb']:.2f} MB")
+                    c2.metric("Time", f"{stats['time']:.1f} ms")
+                    
+                    st.download_button(
+                        "💾 Download Secure File (.agltps)", 
+                        secure_blob, 
+                        "hybrid_data.agltps"
+                    )
+                except Exception as e:
+                    st.error(f"Error: {e}")
+
+with tab2:
+    st.header("Decompress & Verify")
+    uploaded_secure = st.file_uploader("📂 Upload .agltps", type=["agltps", "bin"])
+    decrypt_pass = st.text_input("Unlock Password", type="password")
+    
+    if uploaded_secure and st.button("🔓 DECOMPRESS"):
+        try:
+            blob = uploaded_secure.read()
+            df_rec = decompress_hybrid(blob, decrypt_pass)
+            st.success("✅ Exact Reconstruction Successful!")
+            st.dataframe(df_rec.head())
+            
+            csv = df_rec.to_csv(index=False).encode('utf-8')
+            st.download_button("📊 Download CSV", csv, "recovered.csv", "text/csv")
+            
+        except Exception as e:
+            st.error("Decryption failed. Wrong password?")
