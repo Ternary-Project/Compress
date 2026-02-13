@@ -1,119 +1,258 @@
-import numpy as np
+import streamlit as st
 import pandas as pd
-from typing import List, Union, Dict, Tuple, Optional
+import numpy as np
+import struct
+from io import BytesIO
+import time
+import zstandard as zstd
 
-__all__ = ["DeltaTernary"]
-
+# --- 1. CORE COMPRESSOR: DELTA TERNARY ---
 class DeltaTernary:
-    """
-    TPS v2.0: Multi-Column Financial Compression Engine.
-    Now supports compressing entire DataFrames (OHLCV) at once.
-    """
-    
-    def __init__(self, threshold: float = 0.005):
-        if threshold <= 0: raise ValueError("Threshold must be positive.")
-        self.threshold = float(threshold)
+    def __init__(self, threshold=0.0001):
+        self.threshold = threshold
         self._powers = np.array([1, 3, 9, 27, 81], dtype=np.uint8)
 
-    # --- CORE COMPRESSION (Single Array) ---
-    def _compress_array(self, price_array: np.ndarray) -> Tuple[bytes, int]:
-        """Internal method to compress a single 1D array."""
-        try:
-            prices = np.asarray(price_array, dtype=np.float64)
-            if not np.isfinite(prices).all() or len(prices) < 2: return b"", 0
-            
-            # Delta Calculation
-            prev = prices[:-1]
-            curr = prices[1:]
-            with np.errstate(divide='ignore', invalid='ignore'):
-                deltas = np.where(prev != 0, (curr - prev) / prev, 0.0)
-
-            # Quantize
-            trits = np.zeros(len(deltas), dtype=np.int8)
-            trits[deltas > self.threshold] = 1
-            trits[deltas < -self.threshold] = -1
-            
-            # Pack
-            storage_trits = (trits + 1).astype(np.uint8)
-            remainder = len(storage_trits) % 5
-            if remainder != 0:
-                storage_trits = np.pad(storage_trits, (0, 5 - remainder), constant_values=1)
-            
-            packed = np.dot(storage_trits.reshape(-1, 5), self._powers).astype(np.uint8)
-            return packed.tobytes(), len(trits)
-        except Exception:
-            return b"", 0
-
-    def _decompress_array(self, packed: bytes, orig_len: int, start_val: float) -> np.ndarray:
-        """Internal method to decompress a single 1D array."""
-        if not packed: return np.array([start_val])
+    def compress(self, data):
+        """Compress float residuals into 5-trit packed bytes"""
+        if len(data) == 0: return b"", 0
         
-        # Unpack
-        v = np.frombuffer(packed, dtype=np.uint8)
-        temp = v[:, np.newaxis]
+        # Scale floats to integers (lossless-ish precision)
+        # Using 100,000 scaling preserves 5 decimal places
+        scaled = np.round(data * 100000).astype(np.int64)
+        
+        # Delta Encoding
+        deltas = np.diff(scaled, prepend=0)
+        
+        # Ternary Map (-1, 0, 1)
+        signs = np.sign(deltas).astype(np.int8)
+        
+        # Pack Trits
+        storage = (signs + 1).astype(np.uint8)
+        padding = (5 - (len(storage) % 5)) % 5
+        if padding:
+            storage = np.pad(storage, (0, padding), constant_values=1)
+        
+        matrix = storage.reshape(-1, 5)
+        packed_trits = np.dot(matrix, self._powers).astype(np.uint8).tobytes()
+        
+        # Store Magnitudes (VarInt or Raw)
+        # For speed/simplicity in Python, we use Zstd on the raw magnitudes
+        magnitudes = np.abs(deltas).astype(np.uint32)
+        packed_mags = zstd.compress(magnitudes.tobytes(), level=1)
+        
+        # Header: LenTrits(4), LenMags(4)
+        header = struct.pack('II', len(packed_trits), len(packed_mags))
+        return header + packed_trits + packed_mags, len(data)
+
+    def decompress(self, buffer, count):
+        if count == 0: return np.array([])
+        
+        # Read Header
+        len_trits, len_mags = struct.unpack('II', buffer[:8])
+        ptr = 8
+        
+        # Unpack Trits
+        trits_bytes = buffer[ptr : ptr+len_trits]
+        ptr += len_trits
+        
+        raw = np.frombuffer(trits_bytes, dtype=np.uint8)
+        temp = raw[:, np.newaxis]
         powers = self._powers[np.newaxis, :]
-        trits = ((temp // powers) % 3).astype(np.int8).flatten()[:orig_len] - 1
+        signs = ((temp // powers) % 3).astype(np.int8).flatten()[:count] - 1
+        
+        # Unpack Magnitudes
+        mags_bytes = buffer[ptr : ptr+len_mags]
+        magnitudes = np.frombuffer(zstd.decompress(mags_bytes), dtype=np.uint32)[:count]
         
         # Reconstruct
-        changes = trits.astype(np.float64) * self.threshold
-        recon = start_val * np.cumprod(1 + changes)
-        return np.insert(recon, 0, start_val)
+        deltas = signs * magnitudes
+        restored = np.cumsum(deltas)
+        return restored / 100000.0
 
-    # --- DATASET COMPRESSION (Full DataFrame) ---
-    def compress_dataset(self, df: pd.DataFrame) -> Dict[str, any]:
-        """
-        Compresses ALL numeric columns in a DataFrame.
-        Returns a dictionary suitable for np.savez_compressed.
-        """
-        archive = {}
-        # Filter for numeric columns only
+# --- 2. ADAPTIVE ULTRA TPS (The High Compression Engine) ---
+class AdaptiveUltraTPS:
+    def __init__(self):
+        # We test these chunk sizes to see which gives best ratio
+        self.chunk_patterns = [4096, 8192, 16384, 32768, 65536]
+        
+    def compress_column(self, data):
+        """Finds best chunk size and compresses"""
+        # Clean data
+        data = np.nan_to_num(data).astype(np.float64)
+        
+        best_ratio = -1
+        best_blob = None
+        best_idx = 0
+        
+        # 1. ADAPTIVE PASS: Try all patterns
+        # To save time, we only test on the first 100k rows if data is huge
+        test_data = data[:100000] if len(data) > 200000 else data
+        
+        for idx, chunk_size in enumerate(self.chunk_patterns):
+            # Compress just the test portion to find the 'winning' size
+            candidate = self._chunk_compress(test_data, chunk_size)
+            ratio = len(test_data) * 8 / len(candidate)
+            
+            if ratio > best_ratio:
+                best_ratio = ratio
+                best_idx = idx
+        
+        # 2. FINAL PASS: Compress full data with winner
+        optimal_size = self.chunk_patterns[best_idx]
+        final_compressed = self._chunk_compress(data, optimal_size)
+        
+        # Header: [BestPatternIndex(1 byte)]
+        header = struct.pack('B', best_idx)
+        return header + final_compressed, optimal_size
+
+    def _chunk_compress(self, data, chunk_size):
+        chunks = []
+        
+        for i in range(0, len(data), chunk_size):
+            chunk = data[i:i+chunk_size]
+            
+            # A. Smart Baseline (Median is robust against outliers)
+            baseline = np.median(chunk)
+            
+            # B. Residuals
+            residuals = chunk - baseline
+            
+            # C. Identify Exceptions (Values that aren't the baseline)
+            # Using a tiny epsilon for float comparison
+            is_exception = np.abs(residuals) > 1e-5
+            
+            exceptions = residuals[is_exception]
+            
+            # D. Sparse Encoding (RLE of Zeros)
+            # We need to know WHERE the exceptions are.
+            # We store the "Run Length" of zeros between exceptions.
+            # ex: [0, 0, 0, 5, 0, 0, 2] -> runs: [3, 2] -> values: [5, 2]
+            
+            indices = np.where(is_exception)[0]
+            if len(indices) > 0:
+                # Calculate distances between indices
+                # Add -1 to start to get distance to first item
+                padded_indices = np.concatenate(([-1], indices))
+                zero_runs = np.diff(padded_indices) - 1
+                
+                # Compress runs (uint16 is usually enough, fallback to u32)
+                # Zstd crushes these integer sequences
+                runs_bytes = zstd.compress(zero_runs.astype(np.uint32).tobytes(), level=1)
+                
+                # Compress Exception Values (TPS)
+                dt = DeltaTernary()
+                exc_bytes, _ = dt.compress(exceptions)
+            else:
+                runs_bytes = b""
+                exc_bytes = b""
+
+            # E. Chunk Header
+            # [Count(4), Baseline(8), LenRuns(4), LenExc(4)]
+            ch_header = struct.pack('IdII', len(chunk), baseline, len(runs_bytes), len(exc_bytes))
+            
+            chunks.append(ch_header + runs_bytes + exc_bytes)
+            
+        return b''.join(chunks)
+
+    def decompress_column(self, buffer):
+        # 1. Read Global Header
+        best_idx = struct.unpack('B', buffer[:1])[0]
+        # optimal_size = self.chunk_patterns[best_idx] # Not strictly needed for decoding if headers have len
+        offset = 1
+        
+        output = []
+        
+        while offset < len(buffer):
+            # 2. Read Chunk Header
+            # [Count(4), Baseline(8), LenRuns(4), LenExc(4)]
+            count, baseline, len_runs, len_exc = struct.unpack('IdII', buffer[offset:offset+20])
+            offset += 20
+            
+            chunk = np.full(count, baseline, dtype=np.float64)
+            
+            if len_exc > 0:
+                # 3. Read Runs
+                runs_blob = buffer[offset : offset+len_runs]
+                offset += len_runs
+                zero_runs = np.frombuffer(zstd.decompress(runs_blob), dtype=np.uint32)
+                
+                # 4. Read Values
+                exc_blob = buffer[offset : offset+len_exc]
+                offset += len_exc
+                dt = DeltaTernary()
+                exceptions = dt.decompress(exc_blob, len(zero_runs)) # count runs = count exceptions
+                
+                # 5. Reconstruct Positions
+                # runs: [3, 2] -> indices: [3, 3+1+2=6]
+                current_idx = -1
+                for i, run in enumerate(zero_runs):
+                    current_idx += (run + 1)
+                    if current_idx < count:
+                        chunk[current_idx] += exceptions[i]
+            
+            output.append(chunk)
+            
+        return np.concatenate(output)
+
+# --- 3. STREAMLIT APP ---
+st.set_page_config(page_title="Adaptive Ultra", layout="wide")
+st.title("⚡ Adaptive Ultra TPS")
+st.markdown("**Auto-Tuning Chunk Size • Sparse RLE • Zstd Hybrid**")
+
+tab1, tab2 = st.tabs(["Compress", "Decompress"])
+
+if 'adaptive_blob' not in st.session_state:
+    st.session_state.adaptive_blob = {}
+
+with tab1:
+    f = st.file_uploader("Upload CSV", type="csv")
+    if f and st.button("🚀 Run Adaptive Compression"):
+        df = pd.read_csv(f)
+        compressor = AdaptiveUltraTPS()
+        
+        results = {}
+        total_orig = 0
+        total_comp = 0
+        
+        # Only compress numeric columns
         numeric_cols = df.select_dtypes(include=[np.number]).columns
         
-        print(f"📦 Compressing columns: {list(numeric_cols)}")
+        progress = st.progress(0)
         
-        for col in numeric_cols:
-            values = df[col].dropna().values
-            if len(values) < 2: continue
+        for i, col in enumerate(numeric_cols):
+            data = df[col].values
+            blob, chunk_size = compressor.compress_column(data)
             
-            packed, length = self._compress_array(values)
+            results[col] = blob
+            st.session_state.adaptive_blob[col] = blob
             
-            # Store data with column-specific keys
-            archive[f"col_{col}_packed"] = packed
-            archive[f"col_{col}_len"] = length
-            archive[f"col_{col}_start"] = values[0]
+            orig_size = len(data) * 8
+            comp_size = len(blob)
+            total_orig += orig_size
+            total_comp += comp_size
             
-        return archive
+            st.write(f"**{col}**: Selected Chunk {chunk_size} | Ratio: {orig_size/comp_size:.1f}×")
+            progress.progress((i + 1) / len(numeric_cols))
+            
+        final_ratio = total_orig / total_comp if total_comp > 0 else 0
+        st.success(f"✅ Total Ratio: {final_ratio:.2f}×")
+        
+        # Pack into one file for download
+        buffer = BytesIO()
+        np.savez_compressed(buffer, **results)
+        st.download_button("💾 Download .autps", buffer.getvalue(), "data.autps")
 
-    def decompress_dataset(self, archive_data: Dict[str, any]) -> pd.DataFrame:
-        """
-        Reconstructs a DataFrame from a loaded dictionary/npz.
-        """
-        reconstructed = {}
-        
-        # Identify columns from keys
-        # Keys look like: 'col_Close_packed', 'col_Open_len', etc.
-        keys = list(archive_data.keys())
-        col_names = set()
-        for k in keys:
-            if k.startswith("col_") and k.endswith("_packed"):
-                # Extract 'Close' from 'col_Close_packed'
-                col_name = k[4:-7] 
-                col_names.add(col_name)
-        
-        for col in col_names:
-            try:
-                # Handle numpy 0-d arrays if loaded from npz
-                packed_raw = archive_data[f"col_{col}_packed"]
-                packed = packed_raw.item() if packed_raw.ndim == 0 else packed_raw.tobytes()
-                
-                len_raw = archive_data[f"col_{col}_len"]
-                length = int(len_raw.item()) if len_raw.ndim == 0 else int(len_raw)
-                
-                start_raw = archive_data[f"col_{col}_start"]
-                start = float(start_raw.item()) if start_raw.ndim == 0 else float(start_raw)
-                
-                reconstructed[col] = self._decompress_array(packed, length, start)
-            except Exception as e:
-                print(f"⚠️ Failed to reconstruct {col}: {e}")
-                
-        return pd.DataFrame(reconstructed)
+with tab2:
+    if st.button("🔓 Verify Recovery"):
+        if not st.session_state.adaptive_blob:
+            st.warning("Compress something first!")
+        else:
+            compressor = AdaptiveUltraTPS()
+            recovered_data = {}
+            
+            for col, blob in st.session_state.adaptive_blob.items():
+                recovered_data[col] = compressor.decompress_column(blob)
+            
+            df_rec = pd.DataFrame(recovered_data)
+            st.dataframe(df_rec.head())
+            st.success(f"Recovered {df_rec.shape[0]} rows successfully.")
