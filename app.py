@@ -47,10 +47,15 @@ class HFTFlatBurst:
     @staticmethod
     def compress_chunk(df: pd.DataFrame) -> bytes:
         # Handle timestamp column
+        # if 'Timestamp' in df.columns:
+        #     ts = pd.to_datetime(df['Timestamp']).astype(np.int64) // 10**9
+        # elif 'Date' in df.columns:
+        #     ts = pd.to_datetime(df['Date']).astype(np.int64) // 10**9
+        # Handle timestamp column
         if 'Timestamp' in df.columns:
-            ts = pd.to_datetime(df['Timestamp']).astype(np.int64) // 10**9
+            ts = pd.to_datetime(df['Timestamp']).values.astype(np.int64) // 10**9
         elif 'Date' in df.columns:
-            ts = pd.to_datetime(df['Date']).astype(np.int64) // 10**9
+            ts = pd.to_datetime(df['Date']).values.astype(np.int64) // 10**9
         else:
             ts = np.arange(len(df), dtype=np.int64)
         
@@ -112,8 +117,11 @@ class IndexFlatRLE:
             idx_codes[i] = self.idx_map[val]
         
         # Date delta encoding
+        # if 'Date' in df.columns:
+        #     dates = pd.to_datetime(df['Date']).astype(np.int64) // 10**9
+        # Date delta encoding
         if 'Date' in df.columns:
-            dates = pd.to_datetime(df['Date']).astype(np.int64) // 10**9
+            dates = pd.to_datetime(df['Date']).values.astype(np.int64) // 10**9
         else:
             dates = np.arange(len(df), dtype=np.int64)
         date_deltas = np.diff(dates, prepend=dates[0]).astype(np.int32)
