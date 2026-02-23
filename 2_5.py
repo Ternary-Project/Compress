@@ -151,7 +151,9 @@ def main():
             if flatness > 0.8:
                 st.success(f"Detected HFT data → Will use HFTFlatBurst (40-45×)")
             else:
-                st.info(f"Detected trending data → Will use TernaryDelta (~{35 + 5/threshold:.0f}×)")
+                #st.info(f"Detected trending data → Will use TernaryDelta (~{35 + 5/threshold:.0f}×)")
+                estimated_ratio = "Perfect Precision" if threshold == 0 else f"~{35 + 5/threshold:.0f}×"
+                st.info(f"Detected trending data → Will use TernaryDelta ({estimated_ratio})")
 
         if st.button("🚀 COMPRESS NOW → 42×", type="primary", use_container_width=True):
             progress = st.progress(0)
