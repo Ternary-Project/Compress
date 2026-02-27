@@ -1,17 +1,15 @@
-
-# xtps_v5.py
-
 import streamlit as st
 import pandas as pd
 import numpy as np
 import zstandard as zstd
 from io import BytesIO
 import json
+import gc
 
 
 class XTPS:
 
-    VERSION = 50
+    VERSION = 51
 
     def __init__(self, precision='full'):
         self.precision = precision
@@ -20,11 +18,14 @@ class XTPS:
         else:
             self.decimals = int(precision.replace('dp', ''))
 
-    def compress(self, df, chunk_report=None):
+    def compress(self, df, progress_cb=None):
         df = df.reset_index(drop=True)
         n_rows = len(df)
 
         group_col = self._find_group_column(df.columns.tolist())
+
+        if group_col is not None:
+            df = df.sort_values(group_col).reset_index(drop=True)
 
         numeric_cols = []
         string_cols = []
@@ -41,8 +42,8 @@ class XTPS:
                 string_cols.append(col)
 
         if group_col is not None:
-            group_values = df[group_col].astype(str).values
-            groups, group_starts, group_lengths = self._compute_groups(group_values)
+            gv = df[group_col].astype(str).values
+            groups, group_starts, group_lengths = self._compute_groups(gv)
         else:
             groups = ['__ALL__']
             group_starts = [0]
@@ -53,6 +54,8 @@ class XTPS:
 
         save_dict = {}
         col_nan_info = {}
+        total_steps = len(numeric_cols) + len(string_cols) + 2
+        step = 0
 
         for col in numeric_cols:
             raw = df[col].values.astype(np.float64)
@@ -60,6 +63,8 @@ class XTPS:
             has_nans = bool(nan_mask.any())
 
             filled = raw.copy()
+            del raw
+
             for g_idx in range(n_groups):
                 s = group_starts[g_idx]
                 e = s + group_lengths[g_idx]
@@ -88,15 +93,18 @@ class XTPS:
             delta_parts = []
             for g_idx in range(n_groups):
                 s = group_starts[g_idx]
-                g_len = group_lengths[g_idx]
-                e = s + g_len
-                g_filled = filled[s:e]
-                col_starts[g_idx] = g_filled[0] if g_len > 0 else 0.0
-                if g_len > 1:
-                    delta_parts.append(np.diff(g_filled))
+                gl = group_lengths[g_idx]
+                gf = filled[s:s + gl]
+                col_starts[g_idx] = gf[0] if gl > 0 else 0.0
+                if gl > 1:
+                    delta_parts.append(np.diff(gf))
+
+            del filled
+            gc.collect()
 
             if delta_parts:
                 all_deltas = np.concatenate(delta_parts)
+                del delta_parts
             else:
                 all_deltas = np.array([], dtype=np.float64)
 
@@ -113,16 +121,24 @@ class XTPS:
                 save_dict[f'n_{safe}'] = np.packbits(nan_mask)
 
             col_nan_info[col] = {
-                'has_nans': has_nans,
-                'nan_count': int(nan_mask.sum()),
-                'is_int': col in int_cols,
+                'h': has_nans,
+                'c': int(nan_mask.sum()),
+                'i': col in int_cols,
             }
 
-            del raw, filled, nan_mask, col_starts, all_deltas, delta_parts
+            del col_starts, all_deltas, nan_mask
+            gc.collect()
+
+            step += 1
+            if progress_cb:
+                progress_cb(step / total_steps, f"Encoded {col}")
 
         string_data = {}
         for col in string_cols:
             string_data[col] = df[col].astype(str).tolist()
+            step += 1
+            if progress_cb:
+                progress_cb(step / total_steps, f"Stored {col}")
 
         meta = {
             'v': self.VERSION,
@@ -142,30 +158,51 @@ class XTPS:
         save_dict['meta'] = np.void(json.dumps(meta).encode('utf-8'))
         save_dict['scale'] = np.array([scale], dtype=np.float64)
         save_dict['strs'] = np.void(json.dumps(string_data).encode('utf-8'))
+        del string_data
 
         if group_col:
             save_dict['gv'] = np.array(df[group_col].astype(str).values, dtype=object)
 
+        if progress_cb:
+            progress_cb(0.9, "Writing compressed archive...")
+
         buf = BytesIO()
         np.savez_compressed(buf, **save_dict)
-        compressed = buf.getvalue()
+        npz_bytes = buf.getvalue()
         del save_dict, buf
+        gc.collect()
 
-        return zstd.compress(compressed, level=19)
+        if progress_cb:
+            progress_cb(0.95, "Final zstd compression...")
+
+        result = zstd.compress(npz_bytes, level=19)
+        del npz_bytes
+        gc.collect()
+
+        if progress_cb:
+            progress_cb(1.0, "Done")
+
+        return result
 
     @staticmethod
-    def decompress(compressed):
+    def decompress(compressed, progress_cb=None):
+        if progress_cb:
+            progress_cb(0.05, "Decompressing zstd...")
+
         raw = zstd.decompress(compressed)
+        del compressed
+        gc.collect()
+
+        if progress_cb:
+            progress_cb(0.15, "Loading archive...")
+
         data = np.load(BytesIO(raw), allow_pickle=True)
         del raw
+        gc.collect()
 
-        if 'meta' in data and 'scale' in data and 'strs' in data:
-            return XTPS._decompress_v50(data)
+        if 'meta' not in data or 'scale' not in data:
+            raise ValueError("Unknown XTPS format")
 
-        raise ValueError("Unknown XTPS format")
-
-    @staticmethod
-    def _decompress_v50(data):
         meta = json.loads(bytes(data['meta']).decode('utf-8'))
 
         n_rows = meta['nr']
@@ -174,12 +211,13 @@ class XTPS:
         group_col = meta['gc'] if meta['gc'] else None
         numeric_cols = meta['nc']
         string_cols = meta['sc']
-        int_cols = meta['ic']
         column_order = meta['co']
         col_nan_info = meta['ni']
         scale = float(data['scale'][0])
 
         result = {}
+        total_steps = len(numeric_cols) + len(string_cols) + 2
+        step = 0
 
         for col in numeric_cols:
             safe = col.replace(' ', '_').replace('.', '_')
@@ -197,48 +235,79 @@ class XTPS:
             p_off = 0
 
             for g_idx in range(n_groups):
-                g_len = group_lengths[g_idx]
-                nd = g_len - 1
+                gl = group_lengths[g_idx]
+                nd = gl - 1
                 prices[p_off] = starts[g_idx]
                 if nd > 0:
                     gd = deltas[d_off:d_off + nd]
-                    prices[p_off + 1:p_off + g_len] = starts[g_idx] + np.cumsum(gd)
+                    prices[p_off + 1:p_off + gl] = starts[g_idx] + np.cumsum(gd)
                     d_off += nd
-                p_off += g_len
+                p_off += gl
 
-            if info['has_nans']:
+            del starts, deltas
+            gc.collect()
+
+            prices = np.round(prices, decimals=12)
+
+            if info['h']:
                 packed = data[f'n_{safe}']
                 mask = np.unpackbits(packed)[:n_rows].astype(bool)
                 prices[mask] = np.nan
+                del mask
 
-            if info['is_int']:
-                if info['has_nans']:
-                    result[col] = pd.array(
-                        [int(x) if not np.isnan(x) else pd.NA for x in prices],
-                        dtype='Int64'
-                    )
+            if info['i']:
+                if info['h']:
+                    int_list = []
+                    for x in prices:
+                        if np.isnan(x):
+                            int_list.append(pd.NA)
+                        else:
+                            int_list.append(int(x))
+                    result[col] = pd.array(int_list, dtype='Int64')
+                    del int_list
                 else:
                     result[col] = prices.astype(np.int64)
             else:
                 result[col] = prices
 
-            del starts, deltas, prices
+            del prices
+            gc.collect()
+
+            step += 1
+            if progress_cb:
+                progress_cb((0.2 + 0.6 * step / total_steps), f"Recovered {col}")
+
+        if progress_cb:
+            progress_cb(0.85, "Recovering text columns...")
 
         string_data = json.loads(bytes(data['strs']).decode('utf-8'))
         for col in string_cols:
             vals = string_data[col]
             result[col] = [np.nan if v in ('nan', 'None', 'NaN', '') else v for v in vals]
+            step += 1
+            if progress_cb:
+                progress_cb((0.2 + 0.6 * step / total_steps), f"Recovered {col}")
+
+        del string_data
+        gc.collect()
 
         if group_col and 'gv' in data:
             result[group_col] = [str(x) for x in data['gv']]
 
+        if progress_cb:
+            progress_cb(0.92, "Building DataFrame...")
+
         df = pd.DataFrame(result)
         del result
+        gc.collect()
 
         final = [c for c in column_order if c in df.columns]
         for c in df.columns:
             if c not in final:
                 final.append(c)
+
+        if progress_cb:
+            progress_cb(1.0, "Done")
 
         return df[final]
 
@@ -282,8 +351,8 @@ class XTPS:
 
 
 def main():
-    st.set_page_config(page_title="XTPS v5.0", page_icon="⚡", layout="wide")
-    st.title("⚡ XTPS v5.0 — Lossless Financial Compressor")
+    st.set_page_config(page_title="XTPS v5.1", page_icon="⚡", layout="wide")
+    st.title("⚡ XTPS v5.1 — Lossless Financial Compressor")
 
     tab1, tab2 = st.tabs(["🚀 Compress", "📥 Decompress"])
 
@@ -306,21 +375,25 @@ def main():
             )
 
             if st.button("Compress", type="primary", use_container_width=True):
-                with st.spinner("Reading CSV..."):
-                    uploaded.seek(0)
-                    df = pd.read_csv(uploaded)
-                    orig_size = uploaded.size
+                uploaded.seek(0)
+                df = pd.read_csv(uploaded)
+                st.info(f"{len(df):,} rows × {len(df.columns)} cols | {df.isnull().sum().sum():,} NaN values")
 
-                st.info(f"{len(df):,} rows × {len(df.columns)} columns | {df.isnull().sum().sum():,} NaN values")
+                bar = st.progress(0, text="Starting compression...")
 
-                with st.spinner("Compressing..."):
-                    comp = XTPS(precision)
-                    compressed = comp.compress(df)
-                    del df
+                def on_progress(pct, msg):
+                    bar.progress(min(pct, 1.0), text=msg)
 
-                ratio = orig_size / len(compressed)
+                comp = XTPS(precision)
+                compressed = comp.compress(df, progress_cb=on_progress)
+                del df
+                gc.collect()
+
+                bar.progress(1.0, text="Compression complete")
+
+                ratio = uploaded.size / len(compressed)
                 c1, c2, c3 = st.columns(3)
-                c1.metric("Original", f"{orig_size:,} B")
+                c1.metric("Original", f"{uploaded.size:,} B")
                 c2.metric("Compressed", f"{len(compressed):,} B")
                 c3.metric("Ratio", f"{ratio:.1f}×")
 
@@ -338,10 +411,18 @@ def main():
         if xtps:
             st.info(f"{xtps.name} — {xtps.size:,} bytes")
             if st.button("Decompress", type="primary", use_container_width=True):
-                with st.spinner("Decompressing..."):
-                    raw = xtps.read()
-                    df = XTPS.decompress(raw)
-                    del raw
+                raw = xtps.read()
+
+                bar = st.progress(0, text="Starting decompression...")
+
+                def on_progress(pct, msg):
+                    bar.progress(min(pct, 1.0), text=msg)
+
+                df = XTPS.decompress(raw, progress_cb=on_progress)
+                del raw
+                gc.collect()
+
+                bar.progress(1.0, text="Decompression complete")
 
                 st.success(f"{len(df):,} rows × {len(df.columns)} columns recovered")
 
@@ -355,7 +436,12 @@ def main():
                     st.markdown("**Preserved NaN counts**")
                     st.dataframe(nulls[nulls > 0].to_frame("NaN"), use_container_width=True)
 
+                bar2 = st.progress(0, text="Generating CSV...")
                 csv = XTPS.to_csv_bytes(df)
+                bar2.progress(1.0, text="CSV ready")
+                del df
+                gc.collect()
+
                 st.download_button(
                     "Download CSV",
                     csv,
@@ -363,7 +449,6 @@ def main():
                     "text/csv",
                     use_container_width=True,
                 )
-                del df
 
 
 if __name__ == "__main__":
