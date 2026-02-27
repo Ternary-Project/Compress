@@ -1,15 +1,133 @@
 # auto_compress.py — XTPS v3.0 — FIXED EDITION
 # Full CSV recovery | 500×+ real | Zero crashes
 
+# import streamlit as st
+# import pandas as pd
+# import numpy as np
+# import zstandard as zstd
+# from io import BytesIO
+
+# # ══════════════════════════════════════════════════════════════════════════════
+# #  TERNARY DELTA — FULLY WORKING COMPRESSION & DECOMPRESSION
+# # ══════════════════════════════════════════════════════════════════════════════
+
+# class XTPS:
+#     def __init__(self, threshold: float = 0.005):
+#         self.threshold = threshold
+#         self.powers = np.array([1, 3, 9, 27, 81], dtype=np.uint8)
+
+#     def compress(self, df: pd.DataFrame) -> bytes:
+#         # Find price column
+#         price_col = self._find_price_column(df.columns.tolist())
+#         prices = df[price_col].astype(np.float64).values
+        
+#         n_rows = len(prices)
+#         start_price = float(prices[0]) if n_rows > 0 else 0.0
+
+#         if n_rows < 2:
+#             packed = np.array([], dtype=np.uint8).tobytes()
+#             n = 0
+#         else:
+#             deltas = np.diff(prices) / np.where(prices[:-1] != 0, prices[:-1], 1e-10)
+#             trits = np.zeros(len(deltas), dtype=np.int8)
+            
+#             # Safe handling of 0.00% threshold
+#             if self.threshold == 0:
+#                 trits[deltas > 0] = 1
+#                 trits[deltas < 0] = -1
+#             else:
+#                 trits[deltas > self.threshold] = 1
+#                 trits[deltas < -self.threshold] = -1
+
+#             storage = (trits + 1).astype(np.uint8)
+#             pad = (-len(storage)) % 5
+#             if pad:
+#                 storage = np.pad(storage, (0, pad), constant_values=1)
+#             packed = np.dot(storage.reshape(-1, 5), self.powers).astype(np.uint8).tobytes()
+#             n = len(trits)
+
+#         # Store all metadata
+#         buffer = BytesIO()
+#         np.savez_compressed(
+#             buffer,
+#             packed=np.frombuffer(packed, dtype=np.uint8) if packed else np.array([], dtype=np.uint8),
+#             n=np.array([n], dtype=np.int64),
+#             start=np.array([start_price], dtype=np.float64),
+#             threshold=np.array([self.threshold], dtype=np.float64),
+#             columns=np.array(df.columns.tolist(), dtype=object),
+#             price_col=np.array([price_col], dtype=object)
+#         )
+#         return zstd.compress(buffer.getvalue(), level=22)
+
+#     @staticmethod
+#     def _find_price_column(columns):
+#         """Find the price column from a list of column names."""
+#         for c in columns:
+#             if any(x in str(c).lower() for x in ['close', 'price', 'last', 'bid', 'ask']):
+#                 return c
+#         return columns[-1] if columns else 'price'
+
+#     @staticmethod
+#     def decompress(compressed: bytes) -> pd.DataFrame:
+#         try:
+#             decompressed = zstd.decompress(compressed)
+#             data = np.load(BytesIO(decompressed), allow_pickle=True)
+            
+#             # Extract scalar values
+#             n = int(data['n'][0]) if data['n'].shape else int(data['n'])
+#             start = float(data['start'][0]) if data['start'].shape else float(data['start'])
+#             threshold = float(data['threshold'][0]) if data['threshold'].shape else float(data['threshold'])
+            
+#             # Get columns
+#             columns = data['columns'].tolist()
+#             if isinstance(columns[0], bytes):
+#                 columns = [c.decode() for c in columns]
+            
+#             # Get price column
+#             price_col = data['price_col'][0] if 'price_col' in data.files else XTPS._find_price_column(columns)
+#             if isinstance(price_col, bytes):
+#                 price_col = price_col.decode()
+
+#             # Reconstruct prices
+#             if n == 0:
+#                 prices = np.array([start])
+#             else:
+#                 packed = data['packed']
+#                 if len(packed) == 0:
+#                     prices = np.array([start])
+#                 else:
+#                     # Decode ternary
+#                     out = np.empty(len(packed) * 5, dtype=np.int8)
+#                     for i, p in enumerate([1, 3, 9, 27, 81]):
+#                         out[i::5] = (packed // p) % 3
+#                     trits = out[:n] - 1
+                    
+#                     # Reconstruct prices
+#                     changes = trits * threshold
+#                     multipliers = np.concatenate([[1.0], 1 + changes])
+#                     prices = start * np.cumprod(multipliers)
+
+#             # Build DataFrame
+#             df = pd.DataFrame(index=range(len(prices)))
+#             for col in columns:
+#                 if col == price_col:
+#                     df[col] = prices
+#                 else:
+#                     df[col] = np.nan
+                    
+#             return df
+
+#         except Exception as e:
+#             raise ValueError(f"Decompression failed: {str(e)}")
+
+
+
+
 import streamlit as st
 import pandas as pd
 import numpy as np
 import zstandard as zstd
 from io import BytesIO
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  TERNARY DELTA — FULLY WORKING COMPRESSION & DECOMPRESSION
-# ══════════════════════════════════════════════════════════════════════════════
 
 class XTPS:
     def __init__(self, threshold: float = 0.005):
@@ -17,13 +135,13 @@ class XTPS:
         self.powers = np.array([1, 3, 9, 27, 81], dtype=np.uint8)
 
     def compress(self, df: pd.DataFrame) -> bytes:
-        # Find price column
+        # 1. Identify and extract the price column
         price_col = self._find_price_column(df.columns.tolist())
         prices = df[price_col].astype(np.float64).values
-        
         n_rows = len(prices)
         start_price = float(prices[0]) if n_rows > 0 else 0.0
 
+        # 2. Ternary Compression for the Price Column
         if n_rows < 2:
             packed = np.array([], dtype=np.uint8).tobytes()
             n = 0
@@ -31,13 +149,10 @@ class XTPS:
             deltas = np.diff(prices) / np.where(prices[:-1] != 0, prices[:-1], 1e-10)
             trits = np.zeros(len(deltas), dtype=np.int8)
             
-            # Safe handling of 0.00% threshold
-            if self.threshold == 0:
-                trits[deltas > 0] = 1
-                trits[deltas < 0] = -1
-            else:
-                trits[deltas > self.threshold] = 1
-                trits[deltas < -self.threshold] = -1
+            # Use a tiny epsilon if threshold is 0 to allow movement
+            eff_threshold = self.threshold if self.threshold > 0 else 1e-9
+            trits[deltas > eff_threshold] = 1
+            trits[deltas < -eff_threshold] = -1
 
             storage = (trits + 1).astype(np.uint8)
             pad = (-len(storage)) % 5
@@ -46,7 +161,12 @@ class XTPS:
             packed = np.dot(storage.reshape(-1, 5), self.powers).astype(np.uint8).tobytes()
             n = len(trits)
 
-        # Store all metadata
+        # 3. LOSSLESS RECOVERY: Store all other columns separately
+        other_df = df.drop(columns=[price_col])
+        other_data_buffer = BytesIO()
+        other_df.to_pickle(other_data_buffer) # Preserves types (Dates, Strings, etc.)
+
+        # 4. Save everything into the compressed bundle
         buffer = BytesIO()
         np.savez_compressed(
             buffer,
@@ -54,14 +174,14 @@ class XTPS:
             n=np.array([n], dtype=np.int64),
             start=np.array([start_price], dtype=np.float64),
             threshold=np.array([self.threshold], dtype=np.float64),
-            columns=np.array(df.columns.tolist(), dtype=object),
-            price_col=np.array([price_col], dtype=object)
+            price_col=np.array([price_col], dtype=object),
+            column_order=np.array(df.columns.tolist(), dtype=object),
+            other_data=other_data_buffer.getvalue()
         )
         return zstd.compress(buffer.getvalue(), level=22)
 
     @staticmethod
     def _find_price_column(columns):
-        """Find the price column from a list of column names."""
         for c in columns:
             if any(x in str(c).lower() for x in ['close', 'price', 'last', 'bid', 'ask']):
                 return c
@@ -73,48 +193,38 @@ class XTPS:
             decompressed = zstd.decompress(compressed)
             data = np.load(BytesIO(decompressed), allow_pickle=True)
             
-            # Extract scalar values
-            n = int(data['n'][0]) if data['n'].shape else int(data['n'])
-            start = float(data['start'][0]) if data['start'].shape else float(data['start'])
-            threshold = float(data['threshold'][0]) if data['threshold'].shape else float(data['threshold'])
-            
-            # Get columns
-            columns = data['columns'].tolist()
-            if isinstance(columns[0], bytes):
-                columns = [c.decode() for c in columns]
-            
-            # Get price column
-            price_col = data['price_col'][0] if 'price_col' in data.files else XTPS._find_price_column(columns)
-            if isinstance(price_col, bytes):
-                price_col = price_col.decode()
+            n = int(data['n'][0])
+            start = float(data['start'][0])
+            threshold = float(data['threshold'][0])
+            price_col = data['price_col'][0]
+            column_order = data['column_order'].tolist()
 
-            # Reconstruct prices
+            # 1. Reconstruct Prices
             if n == 0:
                 prices = np.array([start])
             else:
                 packed = data['packed']
-                if len(packed) == 0:
-                    prices = np.array([start])
-                else:
-                    # Decode ternary
-                    out = np.empty(len(packed) * 5, dtype=np.int8)
-                    for i, p in enumerate([1, 3, 9, 27, 81]):
-                        out[i::5] = (packed // p) % 3
-                    trits = out[:n] - 1
-                    
-                    # Reconstruct prices
-                    changes = trits * threshold
-                    multipliers = np.concatenate([[1.0], 1 + changes])
-                    prices = start * np.cumprod(multipliers)
+                out = np.empty(len(packed) * 5, dtype=np.int8)
+                for i, p in enumerate([1, 3, 9, 27, 81]):
+                    out[i::5] = (packed // p) % 3
+                trits = out[:n] - 1
+                
+                # Use threshold as the step size for reconstruction
+                eff_threshold = threshold if threshold > 0 else 1e-9
+                changes = trits * eff_threshold
+                multipliers = np.concatenate([[1.0], 1 + changes])
+                prices = start * np.cumprod(multipliers)
 
-            # Build DataFrame
-            df = pd.DataFrame(index=range(len(prices)))
-            for col in columns:
-                if col == price_col:
-                    df[col] = prices
-                else:
-                    df[col] = np.nan
-                    
+            # 2. Recover Other Columns (Lossless)
+            other_data_bytes = data['other_data'].item() if 'other_data' in data else None
+            if other_data_bytes:
+                df = pd.read_pickle(BytesIO(other_data_bytes))
+            else:
+                df = pd.DataFrame()
+
+            # 3. Merge and Reorder
+            df[price_col] = prices
+            df = df[column_order] # Restore original column sequence
             return df
 
         except Exception as e:
